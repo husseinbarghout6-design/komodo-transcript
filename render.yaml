@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: komodo-transcript
+    env: docker
+    plan: standard       # "standard" (2 GB) recommended for Chromium; "starter" may be too small
+    autoDeploy: true
+    region: frankfurt    # close to KSA; or oregon if you prefer US
+    healthCheckPath: /
+    numInstances: 1
