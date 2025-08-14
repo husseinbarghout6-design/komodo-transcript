@@ -1,4 +1,3 @@
-# Playwright + Python + Chromium preinstalled
 FROM mcr.microsoft.com/playwright/python:v1.46.0-jammy
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -7,7 +6,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Only your minimal deps (DO NOT add playwright here)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
