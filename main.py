@@ -12,14 +12,14 @@ class Req(BaseModel):
 
 class MetaReq(BaseModel):
     url: HttpUrl
-    max_chars: Optional[int] = 6000    # safe target per chunk
-    max_segments: Optional[int] = 400  # cap lines per chunk
+    max_chars: Optional[int] = 4500    # safe target per chunk
+    max_segments: Optional[int] = 250  # cap lines per chunk
 
 class ChunkReq(BaseModel):
     url: HttpUrl
     chunk_index: int                   # 0-based
-    max_chars: Optional[int] = 6000
-    max_segments: Optional[int] = 400
+    max_chars: Optional[int] = 4500
+    max_segments: Optional[int] = 250
 
 # ====== Health ======
 @app.get("/")
@@ -80,7 +80,7 @@ def normalize_lines_to_segments(text: str):
     return segments
 
 # ====== Chunking helpers ======
-def chunk_by_limits(segments: List[dict], max_chars=6000, max_segments=400):
+def chunk_by_limits(segments: List[dict], max_chars=4500, max_segments=250):
     """
     Greedy chunking by char budget & segment count.
     Returns: list[list[segment]]
@@ -150,15 +150,15 @@ async def fetch_transcript(req: Req):
 @app.post("/api/fetch-meta")
 async def fetch_meta(req: MetaReq):
     title, segs = await load_title_and_segments(str(req.url))
-    chunks = chunk_by_limits(segs, max_chars=req.max_chars or 6000, max_segments=req.max_segments or 400)
+    chunks = chunk_by_limits(segs, max_chars=req.max_chars or 4500, max_segments=req.max_segments or 250)
     total_chars = sum(len(s.get("text", "")) for s in segs)
     return {
         "title": title,
         "total_segments": len(segs),
         "estimated_total_chars": total_chars,
         "chunks_count": len(chunks),
-        "max_chars": req.max_chars or 6000,
-        "max_segments": req.max_segments or 400
+        "max_chars": req.max_chars or 4500,
+        "max_segments": req.max_segments or 250
     }
 
 # New: fetch a single chunk (safe size for GPT Action)
@@ -168,7 +168,7 @@ async def fetch_chunk(req: ChunkReq):
         raise HTTPException(status_code=400, detail="chunk_index must be >= 0")
 
     title, segs = await load_title_and_segments(str(req.url))
-    chunks = chunk_by_limits(segs, max_chars=req.max_chars or 6000, max_segments=req.max_segments or 400)
+    chunks = chunk_by_limits(segs, max_chars=req.max_chars or 4500, max_segments=req.max_segments or 250)
 
     if req.chunk_index >= len(chunks):
         raise HTTPException(status_code=416, detail="chunk_index out of range")
