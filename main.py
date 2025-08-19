@@ -1,42 +1,34 @@
 import asyncio
 import os
-from typing import List, Optional, Tuple, Iterable, Dict, Any
+from typing import List, Optional, Tuple, Iterable, Dict
 
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query, APIRouter
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from pydantic import BaseModel, HttpUrl
 from bs4 import BeautifulSoup
 
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
-# -----------------------------
+
+# =========================
 # App setup
-# -----------------------------
+# =========================
 app = FastAPI(title="Komodo Transcript Service", version="1.0.0")
 
-from fastapi.responses import JSONResponse, RedirectResponse
+# CORS (adjust as needed)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get("/", include_in_schema=False)
-async def index():
-    # small human & probe-friendly landing page
-    return JSONResponse({
-        "service": "Komodo Transcript Service",
-        "status": "ok",
-        "endpoints": {
-            "health": "/health",
-            "docs": "/docs",
-            "fetch_meta": "/fetch-meta?url=<public_komodo_recording_url>",
-            "process": "/process (POST)",
-        }
-    })
 
-# (optional) nice-to-have: redirect /home -> /docs
-@app.get("/home", include_in_schema=False)
-async def home():
-    return RedirectResponse(url="/docs", status_code=302)
-
-# -----------------------------
+# =========================
 # Models
-# -----------------------------
+# =========================
 class FetchMetaResponse(BaseModel):
     url: str
     title: Optional[str] = None
@@ -48,31 +40,39 @@ class FetchMetaResponse(BaseModel):
     raw_length: int
     notes: Optional[str] = None
 
+
+class FetchMetaBody(BaseModel):
+    url: HttpUrl
+
+
 class ProcessRequest(BaseModel):
     chunks: List[str]
     max_chars: int = 4500
     max_segments: int = 250
+
 
 class ProcessBatchLog(BaseModel):
     processed_of_total: str
     this_batch_segments: int
     this_batch_chars: int
 
+
 class ProcessResponse(BaseModel):
     total_chunks: int
     batches: List[ProcessBatchLog]
     message: str
 
-# -----------------------------
+
+# =========================
 # Helpers
-# -----------------------------
+# =========================
 async def launch_context() -> BrowserContext:
     """
     Launch a Chromium context suitable for Render/docker environments.
     """
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
-        headless=True,  # render-friendly
+        headless=True,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -81,9 +81,9 @@ async def launch_context() -> BrowserContext:
         ],
     )
     context = await browser.new_context()
-    # stash playwright on context so we can stop it later
-    setattr(context, "_pw", pw)
+    setattr(context, "_pw", pw)  # keep a reference so we can stop() later
     return context
+
 
 async def close_context(context: BrowserContext) -> None:
     try:
@@ -93,6 +93,7 @@ async def close_context(context: BrowserContext) -> None:
         if pw:
             await pw.stop()
 
+
 async def safe_goto(page: Page, url: str, timeout_ms: int = 30000) -> None:
     """
     Navigate to a URL with reasonable waiting logic and better error surfacing.
@@ -100,37 +101,38 @@ async def safe_goto(page: Page, url: str, timeout_ms: int = 30000) -> None:
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     except PlaywrightTimeoutError as e:
-        # fallback try: still on the same page? try networkidle briefly
+        # Fallback attempt with networkidle
         try:
             await page.goto(url, wait_until="networkidle", timeout=timeout_ms // 2)
         except Exception as e2:
             raise HTTPException(status_code=504, detail=f"Timeout navigating to {url}: {e2}") from e
 
+
 async def fetch_transcript_html(url: str) -> str:
     """
     Open the provided Komodo recording URL and switch to its transcript tab,
-    then return the page HTML. Fixes the f-string bug on joiner usage.
+    then return the page HTML.
     """
-    # Ensure we land on the transcript tab
+    # Ensure transcript tab
     joiner = "&" if "?" in url else "?"
-    transcript_url = url + f"{joiner}tab=transcript"  # <-- fixed: removed stray "}"
+    transcript_url = url + f"{joiner}tab=transcript"  # fixed (no stray brace)
 
     context = await launch_context()
     page = await context.new_page()
 
     try:
         await safe_goto(page, transcript_url)
-        # A light wait for content if the page loads dynamic elements
-        await page.wait_for_timeout(800)  # small, non-blocking buffer
+        # brief wait for dynamic content
+        await page.wait_for_timeout(800)
         html = await page.content()
         return html
     finally:
         await close_context(context)
 
+
 def extract_meta(html: str) -> Dict[str, Optional[str]]:
     """
     Extract useful metadata and a preview of transcript text from the HTML.
-    Works generically with OpenGraph and common meta tags.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -151,8 +153,6 @@ def extract_meta(html: str) -> Dict[str, Optional[str]]:
     og_site = meta_content(prop="og:site_name")
     desc = meta_content(name="description")
 
-    # Try to find transcript-like content to preview
-    # We will grab text-heavy nodes as a simple preview.
     body_text = soup.get_text(separator="\n", strip=True)
     preview = None
     if body_text:
@@ -167,6 +167,7 @@ def extract_meta(html: str) -> Dict[str, Optional[str]]:
         "transcript_preview": preview,
         "raw_len": len(body_text or ""),
     }
+
 
 def pack_batches(
     chunks: List[str],
@@ -188,7 +189,7 @@ def pack_batches(
             c = chunks[j]
             c_len = len(c)
 
-            # If a single chunk is too large, truncate with clear note
+            # If single chunk exceeds max_chars and batch empty, truncate it
             if c_len > max_chars and segs == 0:
                 truncated = c[:max_chars]
                 yield (j, j + 1, [truncated + "\n[TRUNCATED]"])
@@ -208,30 +209,52 @@ def pack_batches(
             yield (i, j, batch)
             i = j
 
-        # Safety: force progress if nothing was yielded
+        # Safety to force progress
         if not batch and j == i and i < n:
             oversized = chunks[i][:max_chars]
             yield (i, i + 1, [oversized + "\n[FORCED TRUNCATION]"])
             i += 1
 
-# -----------------------------
+
+# =========================
 # Routes
-# -----------------------------
+# =========================
+@app.get("/", include_in_schema=False)
+async def index():
+    return JSONResponse({
+        "service": "Komodo Transcript Service",
+        "status": "ok",
+        "endpoints": {
+            "health": "/health",
+            "docs": "/docs",
+            "fetch_meta_get": "/fetch-meta?url=<public_komodo_recording_url>",
+            "fetch_meta_post": "/fetch-meta",
+            "process_post": "/process",
+        }
+    })
+
+
+@app.get("/home", include_in_schema=False)
+async def home():
+    return RedirectResponse(url="/docs", status_code=302)
+
+
 @app.get("/health")
-async def health() -> Dict[str, str]:
+async def health():
     return {"status": "ok"}
 
-@app.get("/fetch-meta", response_model=FetchMetaResponse)
-async def fetch_meta(url: str = Query(..., description="Public Komodo recording URL")):
-    """
-    Navigate to the recording's transcript tab and extract high-level meta.
-    """
+
+# Unified router for /fetch-meta (GET + POST, with/without trailing slash)
+router = APIRouter()
+
+
+@router.get("/fetch-meta", response_model=FetchMetaResponse)
+@router.get("/fetch-meta/", response_model=FetchMetaResponse)
+async def fetch_meta_get(url: str = Query(..., description="Public Komodo recording URL")):
     if not url.startswith("http"):
         raise HTTPException(status_code=400, detail="Please provide a valid http(s) URL.")
-
     html = await fetch_transcript_html(url)
     meta = extract_meta(html)
-
     return FetchMetaResponse(
         url=url,
         title=meta.get("title"),
@@ -244,6 +267,31 @@ async def fetch_meta(url: str = Query(..., description="Public Komodo recording 
         notes="Fetched transcript tab successfully.",
     )
 
+
+@router.post("/fetch-meta", response_model=FetchMetaResponse)
+@router.post("/fetch-meta/", response_model=FetchMetaResponse)
+async def fetch_meta_post(body: FetchMetaBody):
+    url = str(body.url)
+    html = await fetch_transcript_html(url)
+    meta = extract_meta(html)
+    return FetchMetaResponse(
+        url=url,
+        title=meta.get("title"),
+        description=meta.get("description"),
+        og_title=meta.get("og_title"),
+        og_description=meta.get("og_description"),
+        og_site_name=meta.get("og_site_name"),
+        transcript_text_preview=meta.get("transcript_preview"),
+        raw_length=int(meta.get("raw_len") or 0),
+        notes="Fetched transcript tab successfully.",
+    )
+
+
+# Mount router at root and /api (supports both prefixes)
+app.include_router(router)
+app.include_router(router, prefix="/api")
+
+
 @app.post("/process", response_model=ProcessResponse)
 async def process_chunks(req: ProcessRequest):
     """
@@ -255,7 +303,9 @@ async def process_chunks(req: ProcessRequest):
     logs: List[ProcessBatchLog] = []
     done = 0
 
-    for start, end, batch in pack_batches(chunks, max_chars=req.max_chars, max_segments=req.max_segments):
+    for start, end, batch in pack_batches(
+        chunks, max_chars=req.max_chars, max_segments=req.max_segments
+    ):
         # ---- Replace this block with your real processing call ----
         batch_chars = sum(len(x) for x in batch)
         done = end
@@ -266,23 +316,22 @@ async def process_chunks(req: ProcessRequest):
                 this_batch_chars=batch_chars,
             )
         )
-        # Simulate async work
         await asyncio.sleep(0)  # yield control
         # -----------------------------------------------------------
 
     return ProcessResponse(
         total_chunks=total,
         batches=logs,
-        message="All chunks processed." if done >= total else "Processing completed with caveats."
+        message="All chunks processed." if done >= total else "Processing completed with caveats.",
     )
 
-# -----------------------------
-# Entry point for Render
-# -----------------------------
+
+# =========================
+# Entrypoint (Render)
+# =========================
 if __name__ == "__main__":
     import uvicorn
 
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    # Do NOT enable reload in production/Render
     uvicorn.run("main:app", host=host, port=port, reload=False, workers=1)
