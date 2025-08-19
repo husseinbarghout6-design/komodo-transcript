@@ -168,7 +168,7 @@ async def extract_transcript_text(url: str, deep_scroll: bool) -> Tuple[str, str
             if "tab=transcript" not in url:
                 joiner = "&" if "?" in url else "?"
                 try:
-                    await safe_goto(page, url + f"{joiner}tab=transcript}")
+                    await safe_goto(page, url + f"{joiner}tab=transcript")
                 except Exception:
                     # Fine; fall back to current page
                     pass
