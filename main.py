@@ -23,6 +23,13 @@ SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "200"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "3"))
 
+# Drop obvious Komodo UI strings (exact or startswith matches)
+UI_NOISE_PREFIXES = [
+    "Record in Browser", "Komodo Blog", "Pricing", "Login", "Get Komodo Free",
+    "This is a modal window.", "No compatible source was found for this media.",
+    "Highlights", "Transcript", "Feedback", "Copy", "Chapters", "Annotate"
+]
+
 app = FastAPI()
 
 @app.get("/")
@@ -61,7 +68,6 @@ def cache_get(url: str) -> Optional[Dict[str, Any]]:
 def cache_put(url: str, title: str, segments: List[dict]):
     # evict if too big
     if len(CACHE) >= CACHE_MAX_ITEMS:
-        # remove oldest
         oldest_key = min(CACHE.keys(), key=lambda k: CACHE[k]["ts"])
         try:
             del CACHE[oldest_key]
@@ -123,8 +129,8 @@ TRANSCRIPT_SELECTORS = [
 async def extract_transcript(page, mode: str) -> str:
     """
     Try to extract transcript text with fallbacks.
-    mode = "fast"  -> minimal scrolling, no heavy body fallback
-    mode = "full"  -> deeper scrolling + body fallback
+    mode = "fast"  -> minimal scrolling, NO heavy body.inner_text fallback (HTML strip only)
+    mode = "full"  -> deeper scrolling + body.inner_text fallback
     """
     await click_transcript_tab(page)
     steps = FAST_SCROLL_STEPS if mode == "fast" else FULL_SCROLL_STEPS
@@ -148,6 +154,7 @@ async def extract_transcript(page, mode: str) -> str:
             await autoscroll(page, steps=max(10, steps // 2))
             return await page.locator("body").inner_text(timeout=ACTION_TIMEOUT_MS)
         except Exception:
+            # Ultimate fallback: strip HTML
             html = await page.content()
             txt = re.sub("<[^<]+?>", " ", html)
             return re.sub(r"\s+", " ", txt).strip()
@@ -155,18 +162,47 @@ async def extract_transcript(page, mode: str) -> str:
         # FAST mode: avoid heavy body.inner_text; do a light HTML strip only
         html = await page.content()
         txt = re.sub("<[^<]+?>", " ", html)
-        # Keep it brief in FAST mode
-        return re.sub(r"\s+", " ", txt)[:200000].strip()  # cap to avoid huge strings
+        # Cap size to avoid massive strings and speed up meta step
+        return re.sub(r"\s+", " ", txt)[:200000].strip()
 
 # --------------------
-# Transcript Parsing
+# Transcript Parsing (improved segmentation)
 # --------------------
+def is_noise_line(s: str) -> bool:
+    s = s.strip()
+    if not s:
+        return True
+    for p in UI_NOISE_PREFIXES:
+        if s == p or s.startswith(p):
+            return True
+    return False
+
+def split_heavy_line(line: str) -> List[str]:
+    """
+    If a line is too long, further split on sentence-like boundaries,
+    supporting Arabic punctuation too.
+    """
+    chunks: List[str] = []
+    # Split at Arabic/English sentence delimiters, keeping it simple
+    parts = re.split(r'(?<=[\.\!\?؟؛،])\s+', line)
+    for part in parts:
+        part = part.strip()
+        if part:
+            chunks.append(part)
+    return chunks if chunks else [line]
+
 def normalize_lines_to_segments(text: str) -> List[dict]:
-    segments = []
-    for raw in text.splitlines():
-        ln = raw.strip()
-        if not ln:
+    segments: List[dict] = []
+
+    # First pass: split by newlines OR long whitespace gaps
+    raw_lines = re.split(r'\r+|\n+|\s{4,}', text)
+
+    for raw in raw_lines:
+        ln = (raw or "").strip()
+        if not ln or is_noise_line(ln):
             continue
+
+        # Timestamped like [00:23] text OR 00:23 text
         m = re.match(r'^\[?(\d{1,2}:\d{2}(?:\.\d{1,2})?)\]?\s*(.*)$', ln)
         if m:
             ts, rest = m.groups()
@@ -175,9 +211,25 @@ def normalize_lines_to_segments(text: str) -> List[dict]:
                 sec = int(mm) * 60 + float(ss)
             except Exception:
                 sec = None
-            segments.append({"start": sec, "text": (rest or "").strip()})
+            rest = (rest or "").strip()
+            if not rest:
+                continue
+            # If still too long, split further
+            if len(rest) > 500:
+                for piece in split_heavy_line(rest):
+                    segments.append({"start": sec, "text": piece})
+            else:
+                segments.append({"start": sec, "text": rest})
+            continue
+
+        # Plain line: if very long, split by sentence-ish punctuation
+        if len(ln) > 500:
+            for piece in split_heavy_line(ln):
+                if piece and not is_noise_line(piece):
+                    segments.append({"text": piece})
         else:
             segments.append({"text": ln})
+
     return segments
 
 def chunk_ranges_by_limits(segments: List[dict], max_chars: int, max_segments: int):
@@ -220,10 +272,9 @@ async def scrape_title_and_segments(url: str, mode: str) -> Tuple[str, List[dict
     Scrape in 'fast' or 'full' mode. 'full' also writes to cache.
     """
     # Cache hit?
-    if mode in ("fast", "full"):
-        cached = cache_get(url)
-        if cached:
-            return cached["title"], cached["segments"]
+    cached = cache_get(url)
+    if cached:
+        return cached["title"], cached["segments"]
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(args=["--no-sandbox"])
@@ -250,10 +301,8 @@ async def scrape_title_and_segments(url: str, mode: str) -> Tuple[str, List[dict
 
     segments = normalize_lines_to_segments(text)
 
-    # Only cache on 'full' to avoid partial fast-mode artifacts
-    if mode == "full":
-        cache_put(url, title, segments)
-
+    # Cache result for both modes so subsequent calls are fast
+    cache_put(url, title, segments)
     return title, segments
 
 # --------------------
@@ -262,7 +311,8 @@ async def scrape_title_and_segments(url: str, mode: str) -> Tuple[str, List[dict
 @app.post("/api/fetch-meta")
 async def fetch_meta(req: MetaReq):
     """
-    FAST mode: designed to return within ~10-20s for very large pages to satisfy GPT time budgets.
+    FAST mode: designed to return quickly to satisfy GPT time budgets.
+    Avoids body.inner_text and does light HTML strip if needed.
     """
     try:
         title, segs = await scrape_title_and_segments(str(req.url), mode="fast")
@@ -285,15 +335,13 @@ async def fetch_meta(req: MetaReq):
 @app.post("/api/fetch-chunk")
 async def fetch_chunk(req: ChunkReq):
     """
-    FULL mode: thorough scrape and cached results for subsequent chunk calls.
+    FULL mode: thorough scrape the first time (if not cached), then cached results for subsequent chunk calls.
     """
-    # Try cache first for speed
     cached = cache_get(str(req.url))
     if cached:
         title, segs = cached["title"], cached["segments"]
     else:
         try:
-            # Do a full scrape (heavier) ONCE, then cache
             title, segs = await scrape_title_and_segments(str(req.url), mode="full")
         except PWTimeout:
             raise HTTPException(status_code=504, detail="Timeout loading transcript (page too slow or too large)")
