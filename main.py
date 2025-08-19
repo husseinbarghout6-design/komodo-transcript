@@ -1,32 +1,46 @@
+import os
+import re
+import asyncio
+from typing import List, Optional, Tuple
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
-from playwright.async_api import async_playwright
-import re
-from typing import List, Optional
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+# -----------------------
+# Tunables (env overrides)
+# -----------------------
+GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))        # navigation timeout (default 60s)
+ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "60000"))    # actions/locator timeout (default 60s)
+SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "40"))                 # how many times to scroll
+SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "250"))          # pause between scrolls (ms)
+
+# -----------------------
+# FastAPI app
+# -----------------------
 app = FastAPI(title="Komodo Transcript Fetcher (Chunked)")
 
-# ====== Request models ======
-class Req(BaseModel):
-    url: HttpUrl
-
-class MetaReq(BaseModel):
-    url: HttpUrl
-    max_chars: Optional[int] = 4500    # safe target per chunk
-    max_segments: Optional[int] = 250  # cap lines per chunk
-
-class ChunkReq(BaseModel):
-    url: HttpUrl
-    chunk_index: int                   # 0-based
-    max_chars: Optional[int] = 4500
-    max_segments: Optional[int] = 250
-
-# ====== Health ======
 @app.get("/")
 def health():
     return {"status": "ok"}
 
-# ====== Scraping helpers ======
+# -----------------------
+# Request models
+# -----------------------
+class MetaReq(BaseModel):
+    url: HttpUrl
+    max_chars: Optional[int] = 4500
+    max_segments: Optional[int] = 250
+
+class ChunkReq(BaseModel):
+    url: HttpUrl
+    chunk_index: int
+    max_chars: Optional[int] = 4500
+    max_segments: Optional[int] = 250
+
+# -----------------------
+# Playwright helpers
+# -----------------------
 TRANSCRIPT_SELECTORS = [
     '[data-testid="transcript"]',
     '[id*="transcript"]',
@@ -34,28 +48,82 @@ TRANSCRIPT_SELECTORS = [
     'section:has(h2:regexp("^\\s*Transcript\\s*$"))',
 ]
 
-async def extract_transcript(page):
-    # Try to open "Transcript" tab if present
-    for locator in ["text=Transcript", "role=tab[name='Transcript']"]:
-        if await page.locator(locator).count():
-            await page.click(locator)
-            break
+async def harden_page(page):
+    """Speed up + make scraping resilient: block heavy resources, set timeouts, big viewport."""
+    async def route_block(route):
+        r = route.request
+        if r.resource_type in {"image", "media", "font"}:
+            return await route.abort()
+        return await route.continue_()
+    await page.route("**/*", route_block)
+    await page.set_viewport_size({"width": 1280, "height": 2000})
+    page.set_default_timeout(ACTION_TIMEOUT_MS)
+    page.set_default_navigation_timeout(GOTO_TIMEOUT_MS)
 
-    for sel in TRANSCRIPT_SELECTORS:
+async def goto_with_retry(page, url: str):
+    """Navigate, then try with ?tab=transcript, trying different load states."""
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+    except PWTimeout:
+        pass
+    if "tab=transcript" not in url:
+        joiner = "&" if "?" in url else "?"
+        alt = f"{url}{joiner}tab=transcript"
         try:
-            await page.wait_for_selector(sel, timeout=7000)
-            text = await page.locator(sel).inner_text()
-            if text and len(text.strip()) > 10:
-                return text
+            await page.goto(alt, wait_until="load", timeout=GOTO_TIMEOUT_MS)
+        except PWTimeout:
+            await page.goto(alt, wait_until="networkidle", timeout=GOTO_TIMEOUT_MS)
+
+async def click_transcript_tab(page):
+    for locator in ["text=Transcript", "role=tab[name='Transcript']", "button:has-text('Transcript')"]:
+        try:
+            if await page.locator(locator).count():
+                await page.click(locator, timeout=ACTION_TIMEOUT_MS)
+                break
         except Exception:
             pass
 
-    # Fallback: page text
-    return await page.locator("body").inner_text()
+async def autoscroll(page, steps: int = SCROLL_STEPS, pause_ms: int = SCROLL_PAUSE_MS):
+    for _ in range(steps):
+        await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+        await asyncio.sleep(pause_ms / 1000.0)
 
-def normalize_lines_to_segments(text: str):
+async def extract_transcript(page) -> str:
+    """Try likely transcript containers; fallback to body text; ultimate fallback to stripped HTML."""
+    await click_transcript_tab(page)
+    # trigger lazy-load by scrolling
+    await autoscroll(page)
+
+    # Primary: scoped containers
+    for sel in TRANSCRIPT_SELECTORS:
+        try:
+            if await page.locator(sel).count():
+                el = page.locator(sel).first
+                await el.wait_for(timeout=ACTION_TIMEOUT_MS)
+                text = await el.inner_text(timeout=ACTION_TIMEOUT_MS)
+                if text and len(text.strip()) > 10:
+                    return text
+        except Exception:
+            pass
+
+    # Secondary: body text, after another scroll
+    try:
+        await autoscroll(page)
+        return await page.locator("body").inner_text(timeout=ACTION_TIMEOUT_MS)
+    except Exception:
+        # Ultimate: raw HTML -> strip tags
+        html = await page.content()
+        # Very crude tag strip to avoid extra deps
+        text = re.sub("<[^<]+?>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+# -----------------------
+# Normalization & chunking
+# -----------------------
+def normalize_lines_to_segments(text: str) -> List[dict]:
     """
-    Turn raw transcript into [{'start': seconds?, 'text': '...'}, ...]
+    Convert raw transcript text into segments with optional timestamps.
     Accepts lines like:
       [00:23] Speaker: text
       00:23 text
@@ -69,121 +137,121 @@ def normalize_lines_to_segments(text: str):
         m = re.match(r'^\[?(\d{1,2}:\d{2}(?:\.\d{1,2})?)\]?\s*(.*)$', ln)
         if m:
             ts, rest = m.groups()
-            mm, ss = ts.split(":")
             try:
+                mm, ss = ts.split(":")
                 sec = int(mm) * 60 + float(ss)
-            except ValueError:
+            except Exception:
                 sec = None
             segments.append({"start": sec, "text": (rest or "").strip()})
         else:
             segments.append({"text": ln})
     return segments
 
-# ====== Chunking helpers ======
-def chunk_by_limits(segments: List[dict], max_chars=4500, max_segments=250):
-    """
-    Greedy chunking by char budget & segment count.
-    Returns: list[list[segment]]
-    """
-    chunks, current, chars = [], [], 0
-    for seg in segments:
-        t = seg.get("text", "")
-        # Start a new chunk if we'd exceed limits
-        if (len(current) >= max_segments) or (chars + len(t) > max_chars and current):
-            chunks.append(current)
-            current, chars = [], 0
-        current.append(seg)
-        chars += len(t)
-    if current:
-        chunks.append(current)
-    return chunks
+def estimate_total_chars(segments: List[dict]) -> int:
+    return sum(len(s.get("text", "")) for s in segments)
 
-def flatten_text(segments: List[dict]):
-    """
-    Produce a compact plain-text block the model can read easily.
-    Include timestamps if present as [mm:ss].
-    """
+def chunk_ranges_by_limits(segments: List[dict], max_chars: int, max_segments: int) -> List[Tuple[int, int]]:
+    """Return list of (start_index, end_index_inclusive) ranges that fit limits."""
+    ranges = []
+    i = 0
+    n = len(segments)
+    while i < n:
+        chars = 0
+        count = 0
+        j = i
+        while j < n and count < max_segments and (chars + len(segments[j].get("text", ""))) <= max_chars:
+            chars += len(segments[j].get("text", ""))
+            count += 1
+            j += 1
+        if j == i:  # single segment too large; force include 1 to make progress
+            j = i + 1
+        ranges.append((i, j - 1))
+        i = j
+    return ranges
+
+def build_chunk_text(segments: List[dict], start_idx: int, end_idx: int) -> str:
     lines = []
-    for s in segments:
-        txt = s.get("text", "").strip()
-        if not txt:
+    for k in range(start_idx, end_idx + 1):
+        s = segments[k]
+        t = s.get("text", "")
+        if not t:
             continue
-        start = s.get("start")
-        if start is not None:
-            mm = int(start // 60)
-            ss = int(start % 60)
-            ts = f"{mm:02d}:{ss:02d}"
-            lines.append(f"[{ts}] {txt}")
+        # format timestamp if available
+        ts = s.get("start", None)
+        if ts is not None:
+            mm = int(ts // 60)
+            ss = int(ts % 60)
+            lines.append(f"[{mm:02d}:{ss:02d}] {t}")
         else:
-            lines.append(txt)
+            lines.append(t)
     return "\n".join(lines)
 
-async def load_title_and_segments(url: str):
+# -----------------------
+# Page load + segment extraction
+# -----------------------
+async def load_title_and_segments(url: str) -> Tuple[str, List[dict]]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(args=["--no-sandbox"])
         page = await browser.new_page()
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            if "tab=transcript" not in url:
-                joiner = "&" if "?" in url else "?"
-                await page.goto(url + f"{joiner}tab=transcript", wait_until="domcontentloaded", timeout=15000)
-            raw = await extract_transcript(page)
+            await harden_page(page)
+            await goto_with_retry(page, url)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+            except PWTimeout:
+                pass
+            text = await extract_transcript(page)
             title = await page.title()
         finally:
             await browser.close()
 
-    if not raw or len(raw.strip()) < 10:
+    if not text or len(text.strip()) < 10:
         raise HTTPException(status_code=404, detail="Transcript not found or too short (is the page public?)")
+    return title, normalize_lines_to_segments(text)
 
-    segs = normalize_lines_to_segments(raw)
-    return title, segs
-
-# ====== Endpoints ======
-
-# Backward-compatible: full transcript (OK for short videos)
-@app.post("/api/fetch-transcript")
-async def fetch_transcript(req: Req):
-    title, segs = await load_title_and_segments(str(req.url))
-    return {"title": title, "transcript": segs}
-
-# New: meta (how many chunks we'll have)
+# -----------------------
+# API routes
+# -----------------------
 @app.post("/api/fetch-meta")
 async def fetch_meta(req: MetaReq):
-    title, segs = await load_title_and_segments(str(req.url))
-    chunks = chunk_by_limits(segs, max_chars=req.max_chars or 4500, max_segments=req.max_segments or 250)
-    total_chars = sum(len(s.get("text", "")) for s in segs)
+    try:
+        title, segs = await load_title_and_segments(str(req.url))
+    except PWTimeout:
+        raise HTTPException(status_code=504, detail="Timeout loading transcript (page too slow or too large)")
+    total = len(segs)
+    est_chars = estimate_total_chars(segs)
+    ranges = chunk_ranges_by_limits(segs, req.max_chars or 4500, req.max_segments or 250)
     return {
         "title": title,
-        "total_segments": len(segs),
-        "estimated_total_chars": total_chars,
-        "chunks_count": len(chunks),
+        "total_segments": total,
+        "estimated_total_chars": est_chars,
+        "chunks_count": len(ranges),
         "max_chars": req.max_chars or 4500,
-        "max_segments": req.max_segments or 250
+        "max_segments": req.max_segments or 250,
     }
 
-# New: fetch a single chunk (safe size for GPT Action)
 @app.post("/api/fetch-chunk")
 async def fetch_chunk(req: ChunkReq):
-    if req.chunk_index < 0:
-        raise HTTPException(status_code=400, detail="chunk_index must be >= 0")
+    try:
+        title, segs = await load_title_and_segments(str(req.url))
+    except PWTimeout:
+        raise HTTPException(status_code=504, detail="Timeout loading transcript (page too slow or too large)")
 
-    title, segs = await load_title_and_segments(str(req.url))
-    chunks = chunk_by_limits(segs, max_chars=req.max_chars or 4500, max_segments=req.max_segments or 250)
+    ranges = chunk_ranges_by_limits(segs, req.max_chars or 4500, req.max_segments or 250)
+    m = len(ranges)
+    if m == 0:
+        raise HTTPException(status_code=404, detail="No transcript content available to chunk.")
+    if req.chunk_index < 0 or req.chunk_index >= m:
+        raise HTTPException(status_code=416, detail=f"chunk_index out of range (0..{m-1})")
 
-    if req.chunk_index >= len(chunks):
-        raise HTTPException(status_code=416, detail="chunk_index out of range")
-
-    chunk = chunks[req.chunk_index]
-    text_block = flatten_text(chunk)
-    start_idx = sum(len(c) for c in chunks[:req.chunk_index])
-    end_idx = start_idx + len(chunk) - 1
-
+    start_idx, end_idx = ranges[req.chunk_index]
+    text = build_chunk_text(segs, start_idx, end_idx)
     return {
         "title": title,
         "chunk_index": req.chunk_index,
-        "chunks_count": len(chunks),
-        "segments_in_chunk": len(chunk),
+        "chunks_count": m,
+        "segments_in_chunk": end_idx - start_idx + 1,
         "segments_range": [start_idx, end_idx],
-        "text": text_block,
-        "segments": chunk
+        "text": text,
+        "segments": segs[start_idx:end_idx + 1],
     }
