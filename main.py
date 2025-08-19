@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from playwright.async_api import async_playwright
 import uvicorn
 import math
+import hashlib
+import asyncio
 
 app = FastAPI()
 
@@ -19,26 +21,49 @@ class FetchChunkRequest(BaseModel):
     max_chars: int = 4500
     max_segments: int = 250
 
+# ==== SIMPLE IN-MEMORY CACHE ====
+# Key = sha256(url), Value = {"title": str, "body_text": str}
+CACHE = {}
+CACHE_LOCK = asyncio.Lock()
+
+
 # ==== UTILITIES ====
 
 async def scrape_transcript(url: str):
-    """Scrape title + transcript text from a Komodo link"""
+    """Scrape title + transcript text from a Komodo link using Playwright."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
         await page.goto(url, timeout=60000)
 
-        # Grab title
+        # Grab page title
         title = await page.title()
 
-        # Grab the full body text (adjust selector if transcript is inside a container)
+        # Grab text content (replace selector with transcript container if needed)
         body_text = await page.inner_text("body")
 
         await context.close()
         await browser.close()
 
     return title, body_text
+
+
+async def get_or_cache_transcript(url: str):
+    """Return cached transcript if exists, otherwise scrape and store it."""
+    key = hashlib.sha256(url.encode()).hexdigest()
+    async with CACHE_LOCK:
+        if key in CACHE:
+            return CACHE[key]["title"], CACHE[key]["body_text"]
+
+    # Scrape fresh if not cached
+    title, body_text = await scrape_transcript(url)
+
+    async with CACHE_LOCK:
+        CACHE[key] = {"title": title, "body_text": body_text}
+
+    return title, body_text
+
 
 # ==== ROUTES ====
 
@@ -49,7 +74,7 @@ async def root():
 
 @app.post("/api/fetch-meta")
 async def fetch_meta(req: FetchMetaRequest):
-    title, body_text = await scrape_transcript(req.url)
+    title, body_text = await get_or_cache_transcript(req.url)
 
     total_chars = len(body_text)
     total_segments = len(body_text.split())
@@ -67,7 +92,7 @@ async def fetch_meta(req: FetchMetaRequest):
 
 @app.post("/api/fetch-chunk")
 async def fetch_chunk(req: FetchChunkRequest):
-    title, body_text = await scrape_transcript(req.url)
+    title, body_text = await get_or_cache_transcript(req.url)
 
     total_chars = len(body_text)
     chunks_count = math.ceil(total_chars / req.max_chars)
@@ -86,6 +111,7 @@ async def fetch_chunk(req: FetchChunkRequest):
         "total_chunks": chunks_count,
         "max_chars": req.max_chars,
     }
+
 
 # ==== MAIN ====
 
