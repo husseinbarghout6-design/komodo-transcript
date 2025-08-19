@@ -16,6 +16,10 @@ SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "40"))                 # autoscroll
 SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "250"))          # pause between scrolls (ms)
 
 app = FastAPI()
+@app.get("/")
+async def health():
+    return {"status": "ok", "service": "komodo-transcript", "endpoints": ["/api/fetch-meta", "/api/fetch-chunk"]}
+
 
 # --------------------
 # Request Schemas
