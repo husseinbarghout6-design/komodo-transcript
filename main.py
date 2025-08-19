@@ -1,7 +1,11 @@
 import os
 import re
 import time
+import json
+import gzip
 import asyncio
+import hashlib
+from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Response
@@ -11,15 +15,16 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 # =========================
 # Config (env overridable)
 # =========================
-GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))       # navigation timeout
-ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "60000"))   # element ops timeout
+GOTO_TIMEOUT_MS      = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))
+ACTION_TIMEOUT_MS    = int(os.getenv("ACTION_TIMEOUT_MS", "60000"))
+FAST_SCROLL_STEPS    = int(os.getenv("FAST_SCROLL_STEPS", "4"))     # lighter
+FULL_SCROLL_STEPS    = int(os.getenv("FULL_SCROLL_STEPS", "24"))    # lighter
+SCROLL_PAUSE_MS      = int(os.getenv("SCROLL_PAUSE_MS", "200"))
+MAX_CONCURRENCY      = int(os.getenv("MAX_CONCURRENCY", "1"))       # limit parallel scrapes
 
-FAST_SCROLL_STEPS = int(os.getenv("FAST_SCROLL_STEPS", "8"))       # fast mode (meta)
-FULL_SCROLL_STEPS = int(os.getenv("FULL_SCROLL_STEPS", "60"))      # full mode (chunk)
-SCROLL_PAUSE_MS   = int(os.getenv("SCROLL_PAUSE_MS", "200"))
-
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))
-CACHE_MAX_ITEMS   = int(os.getenv("CACHE_MAX_ITEMS", "3"))
+CACHE_TTL_SECONDS    = int(os.getenv("CACHE_TTL_SECONDS", "1200"))  # 20 minutes
+CACHE_DIR            = Path(os.getenv("CACHE_DIR", "/tmp/komodo_cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 UI_NOISE_PREFIXES = [
     "Record in Browser", "Komodo Blog", "Pricing", "Login", "Get Komodo Free",
@@ -35,8 +40,11 @@ TRANSCRIPT_SELECTORS = [
 ]
 
 app = FastAPI()
+SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
+# =========================
 # Health checks
+# =========================
 @app.get("/")
 async def health():
     return {"status": "ok", "service": "komodo-transcript", "endpoints": ["/api/fetch-meta", "/api/fetch-chunk"]}
@@ -57,32 +65,63 @@ class ChunkReq(MetaReq):
     chunk_index: int
 
 # =========================
-# Small in-memory cache
+# Disk-backed cache helpers
 # =========================
-# cache[url] = {"title": str, "segments": list[dict], "ts": epoch}
-CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_LOCK = asyncio.Lock()
+# In-memory index: url -> {"title": str, "path": Path, "ts": float}
+INDEX: Dict[str, Dict[str, Any]] = {}
+INDEX_LOCK = asyncio.Lock()
 
-def cache_get(url: str) -> Optional[Dict[str, Any]]:
-    item = CACHE.get(url)
-    if not item:
-        return None
-    if time.time() - item["ts"] > CACHE_TTL_SECONDS:
-        try:
-            del CACHE[url]
-        except Exception:
-            pass
-        return None
-    return item
+def _key_for(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
-async def cache_put(url: str, title: str, segments: List[dict]):
-    async with CACHE_LOCK:
-        # evict oldest if over capacity
-        if len(CACHE) >= CACHE_MAX_ITEMS:
-            oldest_key = min(CACHE.keys(), key=lambda k: CACHE[k]["ts"])
-            try: del CACHE[oldest_key]
-            except Exception: pass
-        CACHE[url] = {"title": title, "segments": segments, "ts": time.time()}
+def _file_for(url: str) -> Path:
+    return CACHE_DIR / f"{_key_for(url)}.json.gz"
+
+async def cache_get(url: str) -> Optional[Tuple[str, List[dict]]]:
+    # Check index freshness; if fresh, load from disk
+    async with INDEX_LOCK:
+        meta = INDEX.get(url)
+        if not meta:
+            # If index lost (restart), but file exists, recover meta
+            f = _file_for(url)
+            if f.exists():
+                # Use mtime as ts
+                INDEX[url] = {"title": "(unknown)", "path": f, "ts": f.stat().st_mtime}
+                meta = INDEX[url]
+            else:
+                return None
+        if time.time() - meta["ts"] > CACHE_TTL_SECONDS:
+            # Expired: delete file and index
+            try:
+                if Path(meta["path"]).exists():
+                    Path(meta["path"]).unlink(missing_ok=True)
+            finally:
+                INDEX.pop(url, None)
+            return None
+        path = Path(meta["path"])
+    if not path.exists():
+        return None
+
+    # Load gzipped JSON from disk
+    def _load():
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return payload["title"], payload["segments"]
+
+    title, segments = await asyncio.to_thread(_load)
+    return title, segments
+
+async def cache_put(url: str, title: str, segments: List[dict]) -> None:
+    path = _file_for(url)
+    payload = {"title": title, "segments": segments, "ts": time.time()}
+
+    def _save():
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+
+    await asyncio.to_thread(_save)
+    async with INDEX_LOCK:
+        INDEX[url] = {"title": title, "path": path, "ts": time.time()}
 
 # =========================
 # Playwright helpers
@@ -125,15 +164,11 @@ async def autoscroll(page, steps: int, pause_ms: int = SCROLL_PAUSE_MS):
         await asyncio.sleep(pause_ms / 1000.0)
 
 async def extract_transcript(page, mode: str) -> str:
-    """
-    Extract transcript text.
-    mode="fast": minimal scroll + HTML strip fallback only
-    mode="full": deeper scroll + body.inner_text fallback
-    """
+    # mode: "fast" or "full"
     await click_transcript_tab(page)
     await autoscroll(page, steps=(FAST_SCROLL_STEPS if mode == "fast" else FULL_SCROLL_STEPS))
 
-    # Likely containers first
+    # Try likely containers first
     for sel in TRANSCRIPT_SELECTORS:
         try:
             if await page.locator(sel).count():
@@ -145,24 +180,11 @@ async def extract_transcript(page, mode: str) -> str:
         except Exception:
             pass
 
-    # Fallbacks
+    # Fallback: lighter HTML text strip
     html = await page.content()
     txt = re.sub("<[^<]+?>", " ", html)
     txt = re.sub(r"\s+", " ", txt).strip()
-
-    if mode == "fast":
-        # cap size to avoid heavy strings in meta
-        return txt[:200000]
-    else:
-        # try a heavier body.inner_text only in full mode
-        try:
-            await autoscroll(page, steps=max(10, FULL_SCROLL_STEPS // 2))
-            body_text = await page.locator("body").inner_text(timeout=ACTION_TIMEOUT_MS)
-            if body_text and len(body_text.strip()) > 10:
-                return body_text
-        except Exception:
-            pass
-        return txt
+    return txt
 
 # =========================
 # Parsing & chunking
@@ -252,34 +274,43 @@ def build_chunk_text(segments: List[dict], start_idx: int, end_idx: int) -> str:
     return "\n".join(lines)
 
 # =========================
-# Scrape (FAST/FULL) + cache
+# Scrape (FAST/FULL) with disk cache
 # =========================
 async def scrape_title_and_segments(url: str, mode: str) -> Tuple[str, List[dict]]:
-    # cache?
-    cached = cache_get(url)
+    # Try disk cache first
+    cached = await cache_get(url)
     if cached:
-        return cached["title"], cached["segments"]
+        return cached[0], cached[1]
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(args=["--no-sandbox"])
-        context = await browser.new_context()
-        page = await context.new_page()
-        try:
-            await harden_page(page)
-            await safe_goto(page, url)
-            if "tab=transcript" not in url:
-                joiner = "&" if "?" in url else "?"
-                await safe_goto(page, url + f"{joiner}tab=transcript")
+    async with SEM:  # limit concurrent Playwright sessions
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",  # use disk instead of /dev/shm
+                    "--disable-gpu",
+                    "--no-zygote",
+                ]
+            )
+            context = await browser.new_context()
+            page = await context.new_page()
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=GOTO_TIMEOUT_MS)
-            except PWTimeout:
-                pass
+                await harden_page(page)
+                await safe_goto(page, url)
+                if "tab=transcript" not in url:
+                    joiner = "&" if "?" in url else "?"
+                    await safe_goto(page, url + f"{joiner}tab=transcript")
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+                except PWTimeout:
+                    pass
 
-            text = await extract_transcript(page, mode=mode)
-            title = await page.title()
-        finally:
-            await context.close()
-            await browser.close()
+                text = await extract_transcript(page, mode=mode)
+                title = await page.title()
+            finally:
+                await context.close()
+                await browser.close()
 
     if not text or len(text.strip()) < 10:
         raise HTTPException(status_code=404, detail="Transcript not found or too short (is the page public?)")
@@ -295,8 +326,8 @@ async def scrape_title_and_segments(url: str, mode: str) -> Tuple[str, List[dict
 @app.post("/api/fetch-meta/")
 async def fetch_meta(req: MetaReq):
     try:
-        # Use FULL once so we actually see transcript in meta too
-        title, segs = await scrape_title_and_segments(str(req.url), mode="full")
+        # Use "fast" to be lighter; still returns correct chunk counts after normalization
+        title, segs = await scrape_title_and_segments(str(req.url), mode="fast")
     except PWTimeout:
         raise HTTPException(status_code=504, detail="Timeout loading transcript (page too slow or too large)")
 
@@ -316,10 +347,10 @@ async def fetch_meta(req: MetaReq):
 @app.post("/api/fetch-chunk")
 @app.post("/api/fetch-chunk/")
 async def fetch_chunk(req: ChunkReq):
-    # If cached from meta, use cache; else scrape FULL
-    cached = cache_get(str(req.url))
+    # If cached from meta, use cache; else scrape "full" once (heavier) then cache to disk
+    cached = await cache_get(str(req.url))
     if cached:
-        title, segs = cached["title"], cached["segments"]
+        title, segs = cached
     else:
         try:
             title, segs = await scrape_title_and_segments(str(req.url), mode="full")
@@ -346,6 +377,5 @@ async def fetch_chunk(req: ChunkReq):
         "segments_in_chunk": end_idx - start_idx + 1,
         "segments_range": [start_idx, end_idx],
         "text": text,
-        "segments": segs[start_idx:end_idx + 1],
-        "cached": cached is not None
+        "cached": True
     }
