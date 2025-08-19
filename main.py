@@ -13,6 +13,27 @@ from playwright.async_api import async_playwright, Page, BrowserContext, Timeout
 # -----------------------------
 app = FastAPI(title="Komodo Transcript Service", version="1.0.0")
 
+from fastapi.responses import JSONResponse, RedirectResponse
+
+@app.get("/", include_in_schema=False)
+async def index():
+    # small human & probe-friendly landing page
+    return JSONResponse({
+        "service": "Komodo Transcript Service",
+        "status": "ok",
+        "endpoints": {
+            "health": "/health",
+            "docs": "/docs",
+            "fetch_meta": "/fetch-meta?url=<public_komodo_recording_url>",
+            "process": "/process (POST)",
+        }
+    })
+
+# (optional) nice-to-have: redirect /home -> /docs
+@app.get("/home", include_in_schema=False)
+async def home():
+    return RedirectResponse(url="/docs", status_code=302)
+
 # -----------------------------
 # Models
 # -----------------------------
