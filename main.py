@@ -1,5 +1,6 @@
-import asyncio
 import os
+import asyncio
+from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple, Iterable, Dict
 
 from fastapi import FastAPI, HTTPException, Query, APIRouter
@@ -9,13 +10,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from bs4 import BeautifulSoup
 
-from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
-
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 # =========================
 # App setup
 # =========================
-app = FastAPI(title="Komodo Transcript Service", version="1.0.0")
+app = FastAPI(title="Komodo Transcript Service", version="1.1.0")
 
 # CORS (adjust as needed)
 app.add_middleware(
@@ -25,6 +31,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =========================
+# Render/Playwright tuning
+# =========================
+MAX_PW_CONTEXTS = int(os.getenv("MAX_PW_CONTEXTS", "2"))  # keep low on 512MB RAM
+PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "30000"))
+
+_browser: Optional[Browser] = None
+_pw = None
+_pw_sema = asyncio.Semaphore(MAX_PW_CONTEXTS)
+
+# Start one shared Chromium on startup; close it on shutdown
+@app.on_event("startup")
+async def _startup_playwright():
+    global _pw, _browser
+    _pw = await async_playwright().start()
+    _browser = await _pw.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+    )
+
+@app.on_event("shutdown")
+async def _shutdown_playwright():
+    global _pw, _browser
+    try:
+        if _browser:
+            await _browser.close()
+    finally:
+        _browser = None
+        if _pw:
+            await _pw.stop()
+            _pw = None
+
+@asynccontextmanager
+async def context_page():
+    """
+    Create a lightweight isolated context+page using the shared browser,
+    with concurrency capped by a semaphore.
+    """
+    if _browser is None:
+        raise HTTPException(status_code=500, detail="Browser not initialized.")
+    async with _pw_sema:
+        context: BrowserContext = await _browser.new_context()
+        page: Page = await context.new_page()
+        try:
+            yield context, page
+        finally:
+            await context.close()
 
 # =========================
 # Models
@@ -40,101 +98,58 @@ class FetchMetaResponse(BaseModel):
     raw_length: int
     notes: Optional[str] = None
 
-
 class FetchMetaBody(BaseModel):
     url: HttpUrl
-
 
 class ProcessRequest(BaseModel):
     chunks: List[str]
     max_chars: int = 4500
     max_segments: int = 250
 
-
 class ProcessBatchLog(BaseModel):
     processed_of_total: str
     this_batch_segments: int
     this_batch_chars: int
-
 
 class ProcessResponse(BaseModel):
     total_chunks: int
     batches: List[ProcessBatchLog]
     message: str
 
-
 class FetchChunkBody(BaseModel):
     chunk: str
     max_chars: int = 4500
     max_segments: int = 250
 
-
 # =========================
 # Helpers
 # =========================
-async def launch_context() -> BrowserContext:
-    """
-    Launch a Chromium context suitable for Render/docker environments.
-    """
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
-    )
-    context = await browser.new_context()
-    setattr(context, "_pw", pw)  # keep a reference so we can stop() later
-    return context
-
-
-async def close_context(context: BrowserContext) -> None:
-    try:
-        await context.close()
-    finally:
-        pw = getattr(context, "_pw", None)
-        if pw:
-            await pw.stop()
-
-
-async def safe_goto(page: Page, url: str, timeout_ms: int = 30000) -> None:
+async def safe_goto(page: Page, url: str, timeout_ms: int = PW_NAV_TIMEOUT_MS) -> None:
     """
     Navigate to a URL with reasonable waiting logic and better error surfacing.
     """
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     except PlaywrightTimeoutError as e:
-        # Fallback attempt with networkidle
         try:
             await page.goto(url, wait_until="networkidle", timeout=timeout_ms // 2)
         except Exception as e2:
             raise HTTPException(status_code=504, detail=f"Timeout navigating to {url}: {e2}") from e
-
 
 async def fetch_transcript_html(url: str) -> str:
     """
     Open the provided Komodo recording URL and switch to its transcript tab,
     then return the page HTML.
     """
-    # Ensure transcript tab
     joiner = "&" if "?" in url else "?"
-    transcript_url = url + f"{joiner}tab=transcript"  # fixed (no stray brace)
+    transcript_url = url + f"{joiner}tab=transcript"
 
-    context = await launch_context()
-    page = await context.new_page()
-
-    try:
+    async with context_page() as (_ctx, page):
         await safe_goto(page, transcript_url)
         # brief wait for dynamic content
         await page.wait_for_timeout(800)
         html = await page.content()
         return html
-    finally:
-        await close_context(context)
-
 
 def extract_meta(html: str) -> Dict[str, Optional[str]]:
     """
@@ -173,7 +188,6 @@ def extract_meta(html: str) -> Dict[str, Optional[str]]:
         "transcript_preview": preview,
         "raw_len": len(body_text or ""),
     }
-
 
 def pack_batches(
     chunks: List[str],
@@ -221,7 +235,6 @@ def pack_batches(
             yield (i, i + 1, [oversized + "\n[FORCED TRUNCATION]"])
             i += 1
 
-
 # =========================
 # Routes
 # =========================
@@ -240,20 +253,17 @@ async def index():
         }
     })
 
-
 @app.get("/home", include_in_schema=False)
 async def home():
     return RedirectResponse(url="/docs", status_code=302)
 
-
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
-
+    # also indicates browser status
+    return {"status": "ok", "browser_initialized": _browser is not None}
 
 # Unified router for GET/POST variants and API prefix mounting
 router = APIRouter()
-
 
 @router.get("/fetch-meta", response_model=FetchMetaResponse)
 @router.get("/fetch-meta/", response_model=FetchMetaResponse)
@@ -274,7 +284,6 @@ async def fetch_meta_get(url: str = Query(..., description="Public Komodo record
         notes="Fetched transcript tab successfully.",
     )
 
-
 @router.post("/fetch-meta", response_model=FetchMetaResponse)
 @router.post("/fetch-meta/", response_model=FetchMetaResponse)
 async def fetch_meta_post(body: FetchMetaBody):
@@ -292,7 +301,6 @@ async def fetch_meta_post(body: FetchMetaBody):
         raw_length=int(meta.get("raw_len") or 0),
         notes="Fetched transcript tab successfully.",
     )
-
 
 @router.post("/fetch-chunk")
 @router.post("/fetch-chunk/")
@@ -323,11 +331,9 @@ async def fetch_chunk_post(body: FetchChunkBody):
         "message": "Chunk processed.",
     }
 
-
 # Mount router at root and /api (supports both prefixes)
 app.include_router(router)
 app.include_router(router, prefix="/api")
-
 
 @app.post("/process", response_model=ProcessResponse)
 async def process_chunks(req: ProcessRequest):
@@ -362,13 +368,12 @@ async def process_chunks(req: ProcessRequest):
         message="All chunks processed." if done >= total else "Processing completed with caveats.",
     )
 
-
 # =========================
 # Entrypoint (Render)
 # =========================
 if __name__ == "__main__":
     import uvicorn
-
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
+    # Keep workers=1 so there's only one shared browser
     uvicorn.run("main:app", host=host, port=port, reload=False, workers=1)
