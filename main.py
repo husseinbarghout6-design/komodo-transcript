@@ -1,9 +1,8 @@
 import os
 import re
-import math
 import asyncio
 from contextlib import asynccontextmanager
-from typing import List, Optional, Tuple, Iterable, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,13 +22,13 @@ from playwright.async_api import (
 # =========================
 # App setup
 # =========================
-app = FastAPI(title="Komodo Transcript Service (Chunked)", version="1.2.0")
+app = FastAPI(title="Komodo Transcript Service (Chunked)", version="1.3.0")
 
 # CORS (tighten in prod as needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "GET", "HEAD", "OPTIONS"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -39,9 +38,15 @@ app.add_middleware(
 MAX_PW_CONTEXTS = int(os.getenv("MAX_PW_CONTEXTS", "2"))    # safe for 512 MB
 PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "30000"))
 
-# Auto-scroll to hydrate lazy transcript content inside the scroll container
-AUTO_SCROLL_MAX_STEPS = int(os.getenv("AUTO_SCROLL_MAX_STEPS", "20"))
-AUTO_SCROLL_SLEEP_MS = int(os.getenv("AUTO_SCROLL_SLEEP_MS", "200"))
+# Hydration knobs
+AUTO_SCROLL_MAX_STEPS = int(os.getenv("AUTO_SCROLL_MAX_STEPS", "60"))   # more steps for longer videos
+AUTO_SCROLL_SLEEP_MS = int(os.getenv("AUTO_SCROLL_SLEEP_MS", "150"))    # small delay between scrolls
+HYDRATE_STABLE_ROUNDS = int(os.getenv("HYDRATE_STABLE_ROUNDS", "3"))    # require N unchanged counts before stopping
+TRANSCRIPT_PANE_SELECTORS = os.getenv(
+    "TRANSCRIPT_PANE_SELECTORS",
+    # comma-separated list; can be adjusted via env without code changes
+    '[data-test="transcript"],.overflow-auto.w-full.h-full,.transcript,.Transcript,.transcript-container,.TranscriptContainer'
+).split(",")
 
 _browser: Optional[Browser] = None
 _pw = None
@@ -125,7 +130,7 @@ class FetchChunkReply(BaseModel):
     segments: List[SegmentOut]
 
 # =========================
-# Navigation & parsing
+# Navigation & hydration
 # =========================
 async def safe_goto(page: Page, url: str, timeout_ms: int = PW_NAV_TIMEOUT_MS) -> None:
     try:
@@ -136,37 +141,56 @@ async def safe_goto(page: Page, url: str, timeout_ms: int = PW_NAV_TIMEOUT_MS) -
         except Exception as e2:
             raise HTTPException(status_code=504, detail=f"Timeout navigating to {url}: {e2}") from e
 
-async def _auto_scroll_transcript(page: Page) -> None:
+async def _count_transcript_anchors(page: Page) -> int:
+    # anchors that link with ?t=timestamp are reliable transcript markers
+    return await page.evaluate('document.querySelectorAll(\'a[href*="?t="]\').length')
+
+async def _scroll_to_bottom(page: Page, pane_selector: Optional[str]) -> None:
+    if pane_selector:
+        pane = page.locator(pane_selector).first
+        await pane.evaluate('(el) => el.scrollTo(0, el.scrollHeight)')
+    else:
+        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+
+async def _auto_hydrate_transcript(page: Page) -> None:
     """
-    Scroll the transcript container to force lazy content to render.
-    Falls back to window scroll if the pane isn't found.
+    Wait for transcript anchors to appear, then scroll the transcript pane (or window)
+    until the number of anchors stops increasing for HYDRATE_STABLE_ROUNDS checks.
     """
-    # Based on provided HTML: scrollable transcript pane
-    pane_sel = '.overflow-auto.w-full.h-full'
+    # Wait for the transcript tab to render something anchor-like
     try:
-        if await page.locator(pane_sel).count() > 0:
-            pane = page.locator(pane_sel).first
-            last_h = -1
-            for _ in range(AUTO_SCROLL_MAX_STEPS):
-                h = await pane.evaluate('(el) => el.scrollHeight')
-                if h == last_h:
-                    break
-                last_h = h
-                await pane.evaluate('(el) => el.scrollTo(0, el.scrollHeight)')
-                await page.wait_for_timeout(AUTO_SCROLL_SLEEP_MS)
-        else:
-            # Fallback: scroll the window
-            last_h = -1
-            for _ in range(AUTO_SCROLL_MAX_STEPS):
-                h = await page.evaluate('document.documentElement.scrollHeight')
-                if h == last_h:
-                    break
-                last_h = h
-                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                await page.wait_for_timeout(AUTO_SCROLL_SLEEP_MS)
+        await page.wait_for_selector('a[href*="?t="]', timeout=10000)
     except Exception:
-        # Non-fatal; continue with whatever is loaded
-        pass
+        # No anchors at all → proceed; parsing will fallback
+        return
+
+    # Choose the first pane selector that exists; else None (scroll window)
+    pane_selector: Optional[str] = None
+    for sel in TRANSCRIPT_PANE_SELECTORS:
+        sel = sel.strip()
+        if not sel:
+            continue
+        try:
+            if await page.locator(sel).count() > 0:
+                pane_selector = sel
+                break
+        except Exception:
+            continue
+
+    stable_rounds = 0
+    last_count = await _count_transcript_anchors(page)
+
+    for _ in range(AUTO_SCROLL_MAX_STEPS):
+        await _scroll_to_bottom(page, pane_selector)
+        await page.wait_for_timeout(AUTO_SCROLL_SLEEP_MS)
+        cur_count = await _count_transcript_anchors(page)
+        if cur_count == last_count:
+            stable_rounds += 1
+            if stable_rounds >= HYDRATE_STABLE_ROUNDS:
+                break
+        else:
+            stable_rounds = 0
+            last_count = cur_count
 
 async def fetch_transcript_html(url: str) -> str:
     """
@@ -177,16 +201,22 @@ async def fetch_transcript_html(url: str) -> str:
     transcript_url = url + f"{joiner}tab=transcript"
     async with context_page() as (_ctx, page):
         await safe_goto(page, transcript_url)
-        # Hydrate lazy content inside the transcript pane
-        await _auto_scroll_transcript(page)
+        await _auto_hydrate_transcript(page)
         html = await page.content()
         return html
 
+# =========================
+# Parsing (anchor-first, robust)
+# =========================
 # Timestamp regex: hh?:mm:ss or m:ss
-_TS_RE = re.compile(r"\b(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)\b")
+_TS_RE = re.compile(r"^(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)$")
 
 def _parse_hhmmss_to_seconds(ts: str) -> Optional[float]:
-    m = _TS_RE.fullmatch(ts.strip())
+    ts = ts.strip()
+    parts = ts.split(":")
+    if len(parts) == 2:
+        ts = f"0:{ts}"  # normalize m:ss → 0:m:ss
+    m = _TS_RE.match(ts)
     if not m:
         return None
     hh = int(m.group(1) or 0)
@@ -196,82 +226,37 @@ def _parse_hhmmss_to_seconds(ts: str) -> Optional[float]:
 
 def extract_segments(html: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """
-    Extract (title, segments[{start, text}]) from Komodo transcript DOM.
-    Targets grid rows with a timestamp anchor, then falls back gracefully.
+    Extract (title, segments[{start, text}]) using anchors with ?t= as row heads.
+    We walk to the nearest grid-like container for text, remove the timestamp token,
+    and collapse whitespace.
     """
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.string.strip() if soup.title and soup.title.string else None
 
     segments: List[Dict[str, Any]] = []
 
-    # Primary selector: grid rows that hold [timestamp] [text]
-    # Example class combo seen: div.grid.gap-2.p-2.rounded.text-base (with grid-template-columns: 4.5ch 1fr)
-    row_selector = 'div.grid.gap-2.p-2.rounded.text-base'
-    rows = soup.select(row_selector)
+    anchors = soup.select('a[href*="?t="]')
+    for a in anchors:
+        ts_text = (a.get_text(strip=True) or "").strip()
+        # container row: nearest ancestor with grid-ish classes, else parent
+        row = a.find_parent("div", class_=lambda c: c and "grid" in c) or a.parent
+        text_block = " ".join(row.stripped_strings) if row else ts_text
+        # Remove the first occurrence of timestamp token from the beginning
+        if ts_text and text_block.startswith(ts_text):
+            text_block = text_block[len(ts_text):].strip()
+        # Sometimes anchor is in the middle; remove first occurrence anywhere
+        elif ts_text and ts_text in text_block:
+            text_block = text_block.replace(ts_text, "", 1).strip()
+        text_block = re.sub(r"\s+", " ", text_block)
+        if not text_block:
+            continue
 
-    for row in rows:
-        # first column: timestamp anchor like <a href="... ?t=...">00:05</a>
-        ts_a = row.select_one('span > a[href*="?t="], a[href*="?t="]')
-        ts_text = ts_a.get_text(strip=True) if ts_a else ""
-        start = None
+        start: Optional[float] = None
         if ts_text:
-            parts = ts_text.split(":")
-            # normalize m:ss -> 0:m:ss for parser
-            if len(parts) == 2:
-                ts_norm = f"0:{ts_text}"
-            else:
-                ts_norm = ts_text
-            start = _parse_hhmmss_to_seconds(ts_norm)
+            start = _parse_hhmmss_to_seconds(ts_text)
+        segments.append({"start": start, "text": text_block})
 
-        # second column: tokenized words inside flex container → join strings
-        # Heuristic: take the largest text block that is not the timestamp cell
-        # Prefer the sibling element after the first span (timestamp)
-        # If not found, fall back to row's full text minus timestamp
-        second_col = None
-
-        # Try: find direct children; often the second column is a div/span sibling
-        children = [c for c in row.children if getattr(c, "name", None)]
-        if len(children) >= 2:
-            second_col = children[1]
-        else:
-            # fallback: pick the largest texty descendant
-            cand = None
-            cand_len = -1
-            for d in row.find_all(True):
-                t = d.get_text(strip=True)
-                l = len(t)
-                if l > cand_len:
-                    cand_len = l
-                    cand = d
-            second_col = cand or row
-
-        line_text = " ".join(second_col.stripped_strings).strip()
-        # Remove timestamp echo if it leaked into text
-        if ts_text and line_text.startswith(ts_text):
-            line_text = line_text[len(ts_text):].strip()
-        line_text = re.sub(r"\s+", " ", line_text)
-
-        if line_text:
-            segments.append({"start": start, "text": line_text})
-
-    # Fallback 1: use any anchor with ?t= as row head, grab its container text
-    if not segments:
-        for a in soup.select('a[href*="?t="]'):
-            ts = a.get_text(strip=True)
-            container = a.find_parent('div', class_='grid') or a.parent
-            text_block = " ".join(container.stripped_strings) if container else ts
-            # Remove the timestamp token from the beginning, if present
-            if text_block.startswith(ts):
-                text_block = text_block[len(ts):].strip()
-            text_block = re.sub(r"\s+", " ", text_block)
-            if text_block:
-                # parse ts for start
-                parts = ts.split(":")
-                ts_norm = f"0:{ts}" if len(parts) == 2 else ts
-                start = _parse_hhmmss_to_seconds(ts_norm) if ts else None
-                segments.append({"start": start, "text": text_block})
-
-    # Fallback 2: whole-page lines (last resort)
+    # Fallback: if anchors empty, use generic text (last resort)
     if not segments:
         body_text = soup.get_text(separator="\n", strip=True)
         for ln in (ln.strip() for ln in body_text.splitlines() if ln.strip()):
@@ -308,8 +293,7 @@ def compute_chunks_boundaries(
             j += 1
         if j == i:
             # single segment too large → hard cut to avoid infinite loop
-            take_text = segments[j]["text"][:max_chars]
-            segments[j]["text"] = take_text  # mutate in place for consistency
+            segments[j]["text"] = segments[j]["text"][:max_chars]
             j += 1
         bounds.append((i, j))
         i = j
@@ -319,22 +303,18 @@ def join_text(segments: List[Dict[str, Any]], start: int, end: int) -> str:
     return "\n".join(seg["text"] for seg in segments[start:end])
 
 # =========================
-# Minimal ops endpoints
+# Minimal ops endpoints (GET only; no HEAD)
 # =========================
-@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+@app.get("/", include_in_schema=False)
 async def root():
-    # For HEAD, FastAPI ignores the body; status 200 still returned.
     return JSONResponse({
         "service": "Komodo Transcript Fetcher (Chunked)",
         "status": "ok",
         "health": "/health",
-        "actions": {
-            "fetchMeta": "POST /api/fetch-meta",
-            "fetchChunk": "POST /api/fetch-chunk",
-        }
+        "actions": {"fetchMeta": "POST /api/fetch-meta", "fetchChunk": "POST /api/fetch-chunk"}
     })
 
-@app.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
+@app.get("/health", include_in_schema=False)
 async def health():
     return {"status": "ok", "browser_initialized": _browser is not None}
 
@@ -375,7 +355,6 @@ async def fetch_chunk(body: FetchChunkBody):
     html = await fetch_transcript_html(str(body.url))
     title, segments = extract_segments(html)
 
-    # Recompute SAME boundaries using provided limits to ensure determinism
     boundaries = compute_chunks_boundaries(segments, body.max_chars, body.max_segments)
     chunks_count = len(boundaries)
 
@@ -406,5 +385,4 @@ if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    # workers=1 so we keep a single shared browser
     uvicorn.run("main:app", host=host, port=port, reload=False, workers=1)
