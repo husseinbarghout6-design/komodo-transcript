@@ -63,6 +63,12 @@ class ProcessResponse(BaseModel):
     message: str
 
 
+class FetchChunkBody(BaseModel):
+    chunk: str
+    max_chars: int = 4500
+    max_segments: int = 250
+
+
 # =========================
 # Helpers
 # =========================
@@ -229,6 +235,7 @@ async def index():
             "docs": "/docs",
             "fetch_meta_get": "/fetch-meta?url=<public_komodo_recording_url>",
             "fetch_meta_post": "/fetch-meta",
+            "fetch_chunk_post": "/fetch-chunk",
             "process_post": "/process",
         }
     })
@@ -244,7 +251,7 @@ async def health():
     return {"status": "ok"}
 
 
-# Unified router for /fetch-meta (GET + POST, with/without trailing slash)
+# Unified router for GET/POST variants and API prefix mounting
 router = APIRouter()
 
 
@@ -285,6 +292,36 @@ async def fetch_meta_post(body: FetchMetaBody):
         raw_length=int(meta.get("raw_len") or 0),
         notes="Fetched transcript tab successfully.",
     )
+
+
+@router.post("/fetch-chunk")
+@router.post("/fetch-chunk/")
+async def fetch_chunk_post(body: FetchChunkBody):
+    """
+    Accepts a single 'chunk' and processes it using the same packing rules.
+    Returns the same style of logs as /process but for one chunk.
+    """
+    chunks = [body.chunk]
+    max_chars = body.max_chars
+    max_segments = body.max_segments
+
+    logs = []
+    total = len(chunks)
+    done = 0
+    for start, end, batch in pack_batches(chunks, max_chars=max_chars, max_segments=max_segments):
+        batch_chars = sum(len(x) for x in batch)
+        done = end
+        logs.append({
+            "processed_of_total": f"{done} of {total}",
+            "this_batch_segments": (end - start),
+            "this_batch_chars": batch_chars,
+        })
+
+    return {
+        "total_chunks": total,
+        "batches": logs,
+        "message": "Chunk processed.",
+    }
 
 
 # Mount router at root and /api (supports both prefixes)
